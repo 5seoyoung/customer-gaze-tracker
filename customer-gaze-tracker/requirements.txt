@@ -1,0 +1,8 @@
+opencv-python
+numpy
+torch
+torchvision
+tqdm
+pyyaml
+shapely          
+ultralytics         
