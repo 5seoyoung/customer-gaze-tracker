@@ -1,3 +1,6 @@
 [submodule "customer-gaze-tracker/third_party/yolo-face"]
 	path = customer-gaze-tracker/third_party/yolo-face
 	url = https://github.com/YapaLab/yolo-face
+[submodule "customer-gaze-tracker/third_party/gaze360"]
+	path = customer-gaze-tracker/third_party/gaze360
+	url = https://github.com/erkil1452/gaze360
