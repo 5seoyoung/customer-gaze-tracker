@@ -1,0 +1,28 @@
+# venv / build
+.venv/
+__pycache__/
+*.pyc
+
+# data & outputs
+data/
+!data/.gitkeep
+
+# results, logs
+**/outputs/
+*.log
+*.jsonl
+
+# third-party sources & weights
+third_party/
+!third_party/.gitkeep
+
+# model weights & checkpoints anywhere
+*.pt
+*.pth
+*.onnx
+*.t7
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/

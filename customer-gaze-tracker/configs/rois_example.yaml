@@ -1,0 +1,6 @@
+video_source: "data/samples/store_01.mp4"
+rois:
+  - name: "Shelf_A1"
+    polygon: [[100,120],[340,120],[340,360],[100,360]]
+  - name: "Shelf_B3"
+    polygon: [[400,150],[700,140],[720,380],[410,390]]
