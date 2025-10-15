@@ -1,10 +1,10 @@
 import os, cv2, json, yaml
 from tqdm import tqdm
 
-from detector.yolo_face_adapter import YOLOFaceDetector
-from tracker.deepsort_adapter import DeepSortTracker
-from gaze_estimator.gaze360_adapter import Gaze360Estimator
-from utils.geometry import point_in_which_roi, gaze_intersection_2d
+from .detector.yolo_face_adapter import YOLOFaceDetector
+from .tracker.deepsort_adapter import DeepSortTracker
+from .gaze_estimator.gaze360_adapter import Gaze360Estimator
+from .utils.geometry import point_in_which_roi, gaze_intersection_2d
 
 def main(cfg_path="configs/rois_example.yaml", out_dir="data/outputs"):
     os.makedirs(out_dir, exist_ok=True)
