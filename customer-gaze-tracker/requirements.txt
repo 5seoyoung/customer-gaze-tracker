@@ -1,0 +1,7 @@
+torch
+torchvision
+ultralytics==8.3.213
+deep-sort-realtime
+opencv-python-headless
+numpy
+tqdm
