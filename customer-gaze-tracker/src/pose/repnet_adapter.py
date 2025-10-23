@@ -1,90 +1,69 @@
-# src/pose/repnet_adapter.py
 from __future__ import annotations
-import os
 import cv2
-import torch
 import numpy as np
-import torchvision.transforms as T
+import torch
 
-# pip로 설치된 패키지의 올바른 경로
-from sixdrepnet.model import SixDRepNet
+# --- 안전한 cuda 우회 (CPU에서 에러 방지) ---
+_old_cuda = torch.nn.Module.cuda
+def _safe_cuda(self, device=None):
+    # cuda 사용 가능 + 정수 GPU id일 때만 실제 이동, 그 외엔 no-op
+    if isinstance(device, int) and device >= 0 and torch.cuda.is_available():
+        return _old_cuda(self, device)
+    return self
+torch.nn.Module.cuda = _safe_cuda  # 전역 패치
 
+# pip 패키지의 레그레서(편의 래퍼)
+from sixdrepnet import SixDRepNet
+
+def _clip_box(x1, y1, x2, y2, w, h):
+    x1 = max(0, min(x1, w - 1))
+    y1 = max(0, min(y1, h - 1))
+    x2 = max(0, min(x2, w - 1))
+    y2 = max(0, min(y2, h - 1))
+    return int(x1), int(y1), int(x2), int(y2)
 
 class RepNetHeadPose:
     """
-    6DRepNet 어댑터.
-    - 입력: BGR frame, 얼굴 bbox 리스트(x1,y1,x2,y2)
-    - 출력: 각 bbox별 (yaw, pitch, roll) [degrees]
+    - infer(frame, tlbr_boxes) -> [(yaw, pitch, roll), ...]
+    - CPU 기본. GPU 쓰려면 device='cuda:0'로 만들고 위 패치를 제거/수정하면 됨.
     """
-    def __init__(
-        self,
-        weights_path: str | None = None,   # 헤드포즈 가중치(pth)
-        device: str = "cpu",
-        backbone_name: str = "RepVGG-B1g2",
-        backbone_file: str | None = None   # RepVGG 백본 가중치(pth). 없으면 ""로 생성자만 통과
-    ):
-        self.device = torch.device(device)
+    def __init__(self, weights_path: str | None = None, device: str = "cpu"):
+        # SixDRepNet 레그레서: weights_path를 직접 주입하는 API는 없음
+        # -> 내부 자동 다운로드(or 캐시 사용)를 그대로 활용
+        # (이미 data/weights에 받아둔 pth는 캐시에 복사되어 사용됨)
+        self.model = SixDRepNet()  # 내부에서 cuda() 호출하지만 위에서 no-op 처리됨
+        self.device = device
 
-        # ✅ sixdrepnet은 backbone_file이 필수 인자. 없으면 빈 문자열로 통과.
-        bb_file = backbone_file if backbone_file is not None else ""
+    @staticmethod
+    def _prepare_face(img_bgr: np.ndarray):
+        # SixDRepNet 레그레서의 predict는 BGR 이미지 입력을 받음
+        return img_bgr
 
-        # 일부 포크는 deploy=True 옵션을 기대함
-        self.model = SixDRepNet(backbone_name=backbone_name, backbone_file=bb_file, deploy=True)
-        self.model.to(self.device).eval()
-
-        # (옵션) 헤드포즈 가중치 로드
-        if weights_path and os.path.isfile(weights_path):
-            ckpt = torch.load(weights_path, map_location=self.device)
-            if isinstance(ckpt, dict):
-                # 다양한 키 케이스 처리
-                for k in ("state_dict", "model_state_dict", "net", "model"):
-                    if k in ckpt and isinstance(ckpt[k], dict):
-                        ckpt = ckpt[k]
-                        break
-            try:
-                self.model.load_state_dict(ckpt, strict=False)
-            except Exception:
-                # 키 불일치 대비: 교집합만 로딩
-                model_keys = set(self.model.state_dict().keys())
-                filt = {k: v for k, v in ckpt.items() if k in model_keys}
-                self.model.load_state_dict(filt, strict=False)
-
-        # 전처리 파이프라인
-        self.tf = T.Compose([
-            T.ToTensor(),
-            T.Resize((224, 224)),
-            T.Normalize(mean=[0.485, 0.456, 0.406],
-                        std=[0.229, 0.224, 0.225]),
-        ])
-
-    @torch.no_grad()
-    def infer(self, frame: np.ndarray, bboxes_xyxy: list[tuple[float,float,float,float]]):
-        """returns: list[(yaw, pitch, roll)] in degrees"""
-        outs = []
-        if frame is None:
-            return [(0.0, 0.0, 0.0)] * len(bboxes_xyxy)
-
-        h, w = frame.shape[:2]
-        for (x1, y1, x2, y2) in bboxes_xyxy:
-            x1, y1, x2, y2 = map(int, (x1, y1, x2, y2))
-            x1 = max(0, min(x1, w-1)); x2 = max(0, min(x2, w))
-            y1 = max(0, min(y1, h-1)); y2 = max(0, min(y2, h))
+    def infer(self, frame_bgr: np.ndarray, tlbr_list):
+        """
+        tlbr_list: [(x1,y1,x2,y2), ...]
+        return: [(yaw, pitch, roll), ...]
+        """
+        if not tlbr_list:
+            return []
+        h, w = frame_bgr.shape[:2]
+        ypr_list = []
+        for (x1, y1, x2, y2) in tlbr_list:
+            x1, y1, x2, y2 = _clip_box(x1, y1, x2, y2, w, h)
             if x2 <= x1 or y2 <= y1:
-                outs.append((0.0, 0.0, 0.0)); continue
+                ypr_list.append((0.0, 0.0, 0.0))
+                continue
+            face = frame_bgr[y1:y2, x1:x2].copy()
+            face = self._prepare_face(face)
+            pitch, yaw, roll = self.model.predict(face)  # NOTE: 레그레서 시그니처는 (pitch,yaw,roll)
+            # 우리 파이프라인은 (yaw, pitch, roll)로 맞춰 반환
+            ypr_list.append((float(yaw), float(pitch), float(roll)))
+        return ypr_list
 
-            crop = frame[y1:y2, x1:x2]
-            if crop.size == 0:
-                outs.append((0.0, 0.0, 0.0)); continue
-
-            # BGR -> RGB
-            inp = self.tf(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)).unsqueeze(0).to(self.device)
-            pred = self.model(inp)  # 보통 (B,3) [yaw, pitch, roll], 라디안/도 버전 섞임
-
-            ypr = pred[0].detach().cpu().numpy().astype(float)
-
-            # 라디안 히유리스틱 → 도 단위로 변환
-            if np.mean(np.abs(ypr)) < 3.14:
-                ypr = np.degrees(ypr)
-
-            outs.append(tuple(ypr.tolist()))
-        return outs
+    @staticmethod
+    def draw_axis_on_face(img, box, yaw, pitch, roll, color=(0, 255, 255)):
+        # 간단한 가시화: 박스 좌상단에 yaw/pitch/roll 숫자로 표기
+        x1, y1, x2, y2 = map(int, box)
+        txt = f"y:{yaw:.1f} p:{pitch:.1f} r:{roll:.1f}"
+        cv2.putText(img, txt, (x1, max(0, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 3, cv2.LINE_AA)
+        cv2.putText(img, txt, (x1, max(0, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)

@@ -1,79 +1,83 @@
-# src/run_headpose_demo.py
-import os, json, math
+from __future__ import annotations
+import argparse, os, json
 import cv2
-from tqdm import tqdm
+from src.detector.yolo_face_adapter import YOLOFaceDetector
+from src.tracker.deepsort_adapter import DeepSortAdapter as DeepSORTTracker
+from src.pose.repnet_adapter import RepNetHeadPose
 
-from detector.yolo_face_adapter import YOLOFaceDetector
-from tracker.deepsort_adapter import DeepSortTracker
-from pose.repnet_adapter import SixDRepNetAdapter
-
-def draw_axes(img, center, yaw, pitch, roll, size=80):
-    import numpy as np
-    cx, cy = int(center[0]), int(center[1])
-    yaw, pitch, roll = [math.radians(a) for a in (yaw, pitch, roll)]
-    Rx = np.array([[1,0,0],
-                   [0,math.cos(roll),-math.sin(roll)],
-                   [0,math.sin(roll), math.cos(roll)]])
-    Ry = np.array([[ math.cos(pitch),0,math.sin(pitch)],
-                   [0,1,0],
-                   [-math.sin(pitch),0,math.cos(pitch)]])
-    Rz = np.array([[math.cos(yaw),-math.sin(yaw),0],
-                   [math.sin(yaw), math.cos(yaw),0],
-                   [0,0,1]])
-    R = Rz @ Ry @ Rx
-    axes = np.float32([[size,0,0],[0,size,0],[0,0,size]])
-    proj = axes @ R.T
-    pts = proj[:,:2] + np.float32([cx,cy])
-    X,Y,Z = map(tuple, pts.astype(int))
-    cv2.line(img,(cx,cy),X,(0,0,255),2)   # yaw(빨)
-    cv2.line(img,(cx,cy),Y,(0,255,0),2)   # pitch(초)
-    cv2.line(img,(cx,cy),Z,(255,0,0),2)   # roll(파)
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--video", type=str, default="data/samples/store_01.mp4")
+    ap.add_argument("--out", type=str, default="data/outputs/overlay.mp4")
+    ap.add_argument("--face-weights", type=str, default="data/weights/yolov12n-face.pt")
+    ap.add_argument("--pose-weights", type=str, default="data/weights/6DRepNet_300W_LP_AFLW2000.pth")
+    ap.add_argument("--conf", type=float, default=0.25)
+    ap.add_argument("--device", type=str, default="cpu")
+    return ap.parse_args()
 
 def main():
-    os.makedirs("data/outputs", exist_ok=True)
-    src = "data/samples/store_01.mp4"     # 여기에 테스트 영상 배치
-    out_vid = "data/outputs/headpose_overlay.mp4"
-    out_log = "data/outputs/headpose_log.jsonl"
+    args = parse_args()
+    os.makedirs(os.path.dirname(args.out), exist_ok=True)
 
-    det = YOLOFaceDetector("weights/yolov12n-face.pt", conf_thres=0.25, imgsz=640)
-    trk = DeepSortTracker()
-    hp  = SixDRepNetAdapter("weights/6drepnet.pth")   # 가중치 없으면 dummy(0,0,0)로 진행
+    det = YOLOFaceDetector(model_path=args.face_weights, conf=args.conf, device=args.device)
+    trk = DeepSORTTracker()
+    pose = RepNetHeadPose(weights_path=args.pose_weights, device=args.device)
 
-    cap = cv2.VideoCapture(src)
-    assert cap.isOpened(), f"Cannot open {src}"
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25
-    w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    vw  = cv2.VideoWriter(out_vid, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w,h))
-    logf = open(out_log, "w", encoding="utf-8")
+    cap = cv2.VideoCapture(args.video)
+    assert cap.isOpened(), f"Cannot open video: {args.video}"
 
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    for fidx in tqdm(range(total)):
+    # writer: match source fps/size
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    w  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h  = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(args.out, fourcc, fps, (w,h))
+
+    per_frame_log = []
+    idx = 0
+    while True:
         ok, frame = cap.read()
         if not ok: break
 
-        dets = det.detect(frame)                # [[x1,y1,x2,y2,conf], ...]
-        tracks = trk.update(frame, dets)        # [{"id","tlbr":[...]}...]
+        dets = det.infer(frame)  # (x1,y1,x2,y2,conf)
+        tracks = trk.update(frame, dets)  # [{"id","tlbr":[...]}...]
 
-        for t in tracks:
-            x1,y1,x2,y2 = t["tlbr"]
-            pose = hp.infer(frame, (x1,y1,x2,y2))  # {"yaw","pitch","roll"} or None
-            if pose is None: 
-                continue
+        # head pose per track
+        tlbrs = [tuple(t["tlbr"]) for t in tracks]
+        ypr   = pose.infer(frame, tlbrs) if tlbrs else []
 
-            cx, cy = (x1+x2)//2, (y1+y2)//2
-            cv2.rectangle(frame,(x1,y1),(x2,y2),(0,255,255),2)
-            txt = f"ID {t['id']} | YPR {pose['yaw']:.1f}/{pose['pitch']:.1f}/{pose['roll']:.1f}"
-            cv2.putText(frame, txt, (x1, max(0,y1-8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 2)
-            draw_axes(frame, (cx,cy), pose["yaw"], pose["pitch"], pose["roll"])
+        # draw + log
+        for t, (yaw,pitch,roll) in zip(tracks, ypr):
+            box = tuple(t["tlbr"])
+            RepNetHeadPose.draw_axis_on_face(frame, box, yaw, pitch, roll, color=(0,255,255))
+            cv2.putText(frame, f"ID {t['id']}", (int(box[0]), int(box[1])+14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 3, cv2.LINE_AA)
+            cv2.putText(frame, f"ID {t['id']}", (int(box[0]), int(box[1])+14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1, cv2.LINE_AA)
 
-            rec = {"frame": fidx, "id": t["id"], "bbox":[x1,y1,x2,y2], **pose}
-            logf.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        writer.write(frame)
 
-        vw.write(frame)
+        # minimal JSONL log
+        frame_log = {
+            "frame_idx": idx,
+            "tracks": [
+                {"id": int(t["id"]), "tlbr": [float(v) for v in t["tlbr"]],
+                 "yaw": float(ypr[i][0]), "pitch": float(ypr[i][1]), "roll": float(ypr[i][2])}
+                for i, t in enumerate(tracks)
+            ]
+        }
+        per_frame_log.append(frame_log)
+        idx += 1
 
-    cap.release(); vw.release(); logf.close()
-    print("[DONE]", out_vid, out_log)
+    writer.release()
+    cap.release()
+
+    # save logs
+    with open("data/outputs/headpose_log.json", "w") as f:
+        json.dump(per_frame_log, f)
+
+    print("[DONE] overlay:", args.out)
+    print("[DONE] log: data/outputs/headpose_log.json")
 
 if __name__ == "__main__":
     main()
